@@ -231,6 +231,10 @@ func (c *Client) CheckInclusion(ctx context.Context, tree tlog.Tree, sct []byte)
 }
 
 // Checkpoint fetches the latest checkpoint and verifies it.
+//
+// The signature by [ClientConfig.PublicKey] is always the first
+// [note.Note.Sigs] entry. [RFC6962SignatureTimestamp] can be used to extract
+// the STH timestamp from the signature.
 func (c *Client) Checkpoint(ctx context.Context) (torchwood.Checkpoint, *note.Note, error) {
 	signedNote, err := c.f.ReadEndpoint(ctx, "checkpoint")
 	if err != nil {
