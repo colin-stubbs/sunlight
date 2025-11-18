@@ -1,3 +1,4 @@
+---
 include:
   # include your preferred static content service here. We recommend Caddy as it can be used to front Sunlight and Sunglasses at the same time, 
   #  as well as serve static content that Skylight will not serve.
