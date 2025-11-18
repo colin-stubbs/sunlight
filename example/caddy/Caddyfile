@@ -1,0 +1,85 @@
+{
+	log default {
+		output file /var/log/caddy/caddy.log
+		format json
+	}
+	auto_https off
+
+	servers :80 {
+		name http
+	}
+	default_bind 0.0.0.0
+}
+
+(sunlight) {
+	# Sunlight submission endpoints
+	reverse_proxy /ct/v1/get-roots http://sunlight {
+		header_up Host "localhost"
+	}
+	reverse_proxy /ct/v1/add-chain http://sunlight {
+		header_up Host "localhost"
+	}
+	reverse_proxy /ct/v1/add-pre-chain http://sunlight {
+		header_up Host "localhost"
+	}
+
+	# Sunglasses RFC6962 endpoints, always proxy, even though they won't work unless you elect to include compose-sunglasses.yml
+	reverse_proxy /ct/v1/get-sth http://sunglasses
+	reverse_proxy /ct/v1/get-sth-consistency http://sunglasses
+	reverse_proxy /ct/v1/get-proof-by-hash http://sunglasses
+	reverse_proxy /ct/v1/get-entries http://sunglasses
+	reverse_proxy /ct/v1/get-entry-and-proof http://sunglasses
+
+	# ensure our hosted CT monitor JSON files are served as JSON
+	route /*.json {
+		header Content-Type application/json
+	}
+
+	# static content, e.g. CT checkpoint, CT tiles, CT monitor JSON files, etc.
+	root * /usr/share/caddy
+	file_server
+}
+
+(identified-rate) {
+	rate_limit {
+		zone default {
+			key {remote_host}
+			events 375
+			window 5s
+		}
+		log_key
+	}
+}
+
+(anonymous-rate) {
+	rate_limit {
+		zone default {
+			key {remote_host}
+			events 10
+			window 5s
+		}
+		log_key
+	}
+}
+
+:80 {
+	@identified header_regexp identified User-Agent ^.*@.*\..*$
+
+	route @identified {
+		import identified-rate
+		import sunlight
+	}
+
+	route {
+		import anonymous-rate
+		import sunlight
+	}
+
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 10mb
+			roll_keep 5
+			roll_keep_for 1h
+		}
+	}
+}

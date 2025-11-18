@@ -1,0 +1,23 @@
+services:
+  sunglasses:
+    image: colinstubbs/sunlight:latest
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/sunglasses-entrypoint.sh"]
+    environment:
+      - SUNGLASSES_DB=${SUNGLASSES_DB:-/sunlight/sunglasses.db}
+      - SUNGLASSES_LISTEN_ADDRESS=${SUNGLASSES_LISTEN_ADDRESS:-0.0.0.0}
+      - SUNGLASSES_LISTEN_PORT=${SUNGLASSES_LISTEN_PORT:-80}
+      #- SUNLIGHT_LOG_ID=ONLY SET THIS IF YOU KNOW WHAT YOU'RE DOING.
+      - SUNLIGHT_MONITORING_PREFIX=${SUNLIGHT_MONITORING_PREFIX:-http://localhost}
+      - SUNLIGHT_SUBMISSION_PREFIX=${SUNLIGHT_SUBMISSION_PREFIX:-https://localhost}
+    volumes:
+      - ctlog_data:/tank/logs/${SUNLIGHT_LOG_NAME:-testlog}/data
+    # The RFC6962 API endpoints are proxied via caddy, so port exposure here is not strictly required.
+    #ports:
+    #  - "80:80"
+    healthcheck:
+      test: curl --silent --fail https://localhost:${SUNGLASSES_LISTEN_PORT:-80}/health || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
