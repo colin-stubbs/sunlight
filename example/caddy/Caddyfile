@@ -62,19 +62,7 @@
 	}
 }
 
-:80 {
-	@identified header_regexp identified User-Agent ^.*@.*\..*$
-
-	route @identified {
-		import identified-rate
-		import sunlight
-	}
-
-	route {
-		import anonymous-rate
-		import sunlight
-	}
-
+(logging) {
 	log {
 		output file /var/log/caddy/access.log {
 			roll_size 10mb
@@ -82,4 +70,20 @@
 			roll_keep_for 1h
 		}
 	}
+}
+
+:80 {
+	@identified header_regexp User-Agent ^.+@.+\..+$
+
+	handle @identified {
+		import identified-rate
+		import sunlight
+	}
+
+	handle {
+		import anonymous-rate
+		import sunlight
+	}
+
+	import logging
 }
