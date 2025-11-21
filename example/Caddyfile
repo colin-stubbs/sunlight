@@ -14,13 +14,13 @@
 (sunlight) {
 	# Sunlight submission endpoints
 	reverse_proxy /ct/v1/get-roots http://sunlight {
-		header_up Host "localhost"
+		header_up Host "sunlight"
 	}
 	reverse_proxy /ct/v1/add-chain http://sunlight {
-		header_up Host "localhost"
+		header_up Host "sunlight"
 	}
 	reverse_proxy /ct/v1/add-pre-chain http://sunlight {
-		header_up Host "localhost"
+		header_up Host "sunlight"
 	}
 
 	# Sunglasses RFC6962 endpoints, always proxy, even though they won't work unless you elect to include compose-sunglasses.yml

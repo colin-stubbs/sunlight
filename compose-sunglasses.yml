@@ -9,16 +9,27 @@ services:
       - SUNGLASSES_LISTEN_ADDRESS=${SUNGLASSES_LISTEN_ADDRESS:-0.0.0.0}
       - SUNGLASSES_LISTEN_PORT=${SUNGLASSES_LISTEN_PORT:-80}
       #- SUNLIGHT_LOG_ID=ONLY SET THIS IF YOU KNOW WHAT YOU'RE DOING.
-      - SUNLIGHT_MONITORING_PREFIX=${SUNLIGHT_MONITORING_PREFIX:-http://localhost}
-      - SUNLIGHT_SUBMISSION_PREFIX=${SUNLIGHT_SUBMISSION_PREFIX:-https://localhost}
+      # Uncomment remove caddy below if you're using skylight instead of caddy.
+      #- SUNLIGHT_INTERNAL_MONITORING_PREFIX=${SUNLIGHT_INTERNAL_MONITORING_PREFIX:-http://skylight}
+      - SUNLIGHT_INTERNAL_MONITORING_PREFIX=${SUNLIGHT_INTERNAL_MONITORING_PREFIX:-http://caddy}
+      # assumes you're using the default config without https, adjust as required.
+      - SUNLIGHT_INTERNAL_SUBMISSION_PREFIX=${SUNLIGHT_INTERNAL_SUBMISSION_PREFIX:-http://sunlight}
     volumes:
       - ctlog_data:/tank/logs/${SUNLIGHT_LOG_NAME:-testlog}/data
+      # if developing...
+      - ./sunglasses-entrypoint.sh:/usr/local/bin/sunglasses-entrypoint.sh
     # The RFC6962 API endpoints are proxied via caddy, so port exposure here is not strictly required.
-    #ports:
-    #  - "80:80"
+    ports:
+      # comment this out if you don't want the option of talking to sunglasses directly, or adjust as required.
+      - "82:80"
     healthcheck:
       test: curl --silent --fail https://localhost:${SUNGLASSES_LISTEN_PORT:-80}/health || exit 1
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 30s
+    depends_on:
+      - sunlight
+      # NOTE: if you're using skylight, you'll need to uncomment this and comment out/remove caddy.
+      #- skylight
+      - caddy

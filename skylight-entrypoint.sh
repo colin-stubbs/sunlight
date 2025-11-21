@@ -5,14 +5,14 @@ export SKYLIGHT_LISTEN_PORT=${SKYLIGHT_LISTEN_PORT:-80}
 export SKYLIGHT_TESTCERT=${SKYLIGHT_TESTCERT:-false}
 
 export SUNLIGHT_LOG_NAME=${SUNLIGHT_LOG_NAME:-testlog}
-export SKYLIGHT_MONITORING_PREFIX=${SKYLIGHT_MONITORING_PREFIX:-https://localhost}
+export SKYLIGHT_INTERNAL_URL=${SKYLIGHT_INTERNAL_URL:-http://skylight}
 
 mkdir -p /skylight
 test -f /skylight/skylight.yaml || echo "listen:
   - ${SKYLIGHT_LISTEN_ADDRESS}:${SKYLIGHT_LISTEN_PORT}
 logs:
   - shortname: ${SUNLIGHT_LOG_NAME}
-    monitoringprefix: ${SKYLIGHT_MONITORING_PREFIX}
+    monitoringprefix: ${SKYLIGHT_INTERNAL_URL}
     localdirectory: /tank/logs/${SUNLIGHT_LOG_NAME}/data
     staging: false
 " > /skylight/skylight.yaml

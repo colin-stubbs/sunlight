@@ -19,46 +19,48 @@ services:
       #- TZ=${TZ:-UTC}
       # Debug mode, set to true to enable more verbose output from the entrypoint script.
       #- DEBUG=${DEBUG:-}
-      # set to true to load test certs from testdata/
-      - LOAD_TEST_DATA=${LOAD_TEST_DATA:-false}
-      # set to 1+ to load generated certificates from testdata/generated/compact.chains.ndjson if it exists, requires LOAD_TEST_DATA to be true.
-      - LOAD_GENERATED_CERTS=${LOAD_GENERATED_CERTS:-}
-      # set to 1+ to auto-generate certificates, NOTE: this is dependent upon LOAD_TEST_DATA being true and will not occur if LOAD_TEST_DATA is false.
-      - GEN_TEST_CERTS=${GEN_TEST_CERTS:-}
-      # Location for generated certs are stored in an NDJSON file. Can be relative if the container will generate it itself using the generate.sh script and LOAD_TEST_DATA is true and GEN_TEST_CERTS is set to 1+.
-      # An NDJSON file is used to support very large numbers of certs/chains, e.g 1,000,000+ without the performance impact and inode related limitations that may be present for most file systems.
-      # If you've already generated it once (which is recommended as 1,000,000+ certs will take a long time), and want it in a non-default location (for example via volume file mount) simply adjust this variable
-      # NOTE: LOAD_TEST_DATA must still be true, and LOAD_GENERATED_CERTS must still be set to 1+ to add any cert chains from this file to the CT log.
-      # NOTE: You only need to load test data like this ONCE provided you establish persistent storage for ${ITKO_ROOT_DIRECTORY}. If you're dealing with a large number of certs/chains you will only want to load once.
-      - CERT_CHAINS_NDJSON=${CERT_CHAINS_NDJSON:-compact.chains.ndjson}
       # Sunlight configuration, refer to entrypoint.sh
       - SUNLIGHT_LISTEN_ADDRESS=${SUNLIGHT_LISTEN_ADDRESS:-0.0.0.0}
       # if you don't provide an ACME config or use a test cert via -testcert/sunlight-key.pem/sunlight.pem then sunlight will actually listen on plain HTTP, not HTTPS.
       - SUNLIGHT_LISTEN_PORT=${SUNLIGHT_LISTEN_PORT:-80}
+      # this is so that we know what protocol sunlight will actually be listening on, e.g. http or https.
+      - SUNLIGHT_LISTEN_PROTOCOL=${SUNLIGHT_LISTEN_PROTOCOL:-http}
       - SUNLIGHT_LOG_NAME=${SUNLIGHT_LOG_NAME:-testlog}
       - SUNLIGHT_INCEPTION=${SUNLIGHT_INCEPTION:-}
       - SUNLIGHT_NOT_AFTER_START=${SUNLIGHT_NOT_AFTER_START:-2025-07-01T00:00:00Z}
       - SUNLIGHT_NOT_AFTER_LIMIT=${SUNLIGHT_NOT_AFTER_LIMIT:-2035-01-01T00:00:00Z}
       # this HAS to be provided as a HTTPS URL as sunlight will balk at if not, even when you're not using TLS at all, e.g. no ACME, no -testcert
       # NOTE: that sunlight expects the Host: header to match still, e.g. you'll be able to submit via http://localhost/ct/v1/add-chain but NOT http://127.0.0.1/ct/v1/add-chain which will return a 404.
-      - SUNLIGHT_SUBMISSION_PREFIX=${SUNLIGHT_SUBMISSION_PREFIX:-https://localhost}
+      - SUNLIGHT_INTERNAL_SUBMISSION_PREFIX=https://sunlight
       # NOTE: same thing with skylight, host header will need to match. If you use localhost here even 127.0.0.1 will not work.
-      - SUNLIGHT_MONITORING_PREFIX=${SUNLIGHT_MONITORING_PREFIX:-http://localhost}
+      #- SUNLIGHT_INTERNAL_MONITORING_PREFIX=${SUNLIGHT_INTERNAL_MONITORING_PREFIX:-http://skylight}
+      # Uncomment above and remove below if you're using skylight instead of caddy.
+      - SUNLIGHT_INTERNAL_MONITORING_PREFIX=${SUNLIGHT_INTERNAL_MONITORING_PREFIX:-http://caddy}
       - SUNLIGHT_PERIOD=${SUNLIGHT_PERIOD:-200}
       - SUNLIGHT_POOL_SIZE=${SUNLIGHT_POOL_SIZE:-1}
       - SUNLIGHT_EXTRA_ROOTS_PEM=${SUNLIGHT_EXTRA_ROOTS_PEM:-/sunlight/extra_roots.pem}
       - SUNLIGHT_TESTCERT=${SUNLIGHT_TESTCERT:-false}
-
-    #ports:
-    #  - "81:80"
+    ports:
+      # comment this out if you don't want the option of talking to sunlight directly
+      # NOTE: you will probably need a local host alias in /etc/hosts for "sunglight" pointing to 127.0.0.1
+      - "81:80"
     volumes:
       - ctlog_data:/tank/logs/${SUNLIGHT_LOG_NAME:-testlog}/data
+      # NOTE: you can add your own trusted root CA's to the extra_roots.pem file to ensure they are trusted by sunlight.
+      - ./testdata/extra_roots.pem:/sunlight/extra_roots.pem
+      # if developing...
+      - ./sunlight-entrypoint.sh:/usr/local/bin/sunlight-entrypoint.sh
+      - ./post_start.sh:/sunlight/post_start.sh
     healthcheck:
-      test: curl --silent --fail https://localhost:${SUNLIGHT_LISTEN_PORT:-80}/health || exit 1
+      test: curl --silent --fail ${SUNLIGHT_LISTEN_PROTOCOL:-http}://sunlight:${SUNLIGHT_LISTEN_PORT:-80}/health || exit 1
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 30s
+    depends_on:
+      # change this to skylight and comment/remove caddy if you're using it.
+      # - skylight
+      - caddy
 
 volumes:
   ctlog_data:

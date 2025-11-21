@@ -147,13 +147,5 @@ test -f /tank/logs/${SUNLIGHT_LOG_NAME}/data/monitor-rfc6962.json || echo "${MON
 test -f /tank/logs/${SUNLIGHT_LOG_NAME}/data/monitor-static.json || echo "${MONITOR_STATIC_JSON}" > /tank/logs/${SUNLIGHT_LOG_NAME}/data/monitor-static.json
 test -f /tank/logs/${SUNLIGHT_LOG_NAME}/data/monitor-combined.json || echo "${MONITOR_COMBINED_JSON}" > /tank/logs/${SUNLIGHT_LOG_NAME}/data/monitor-combined.json
 
-#if [ "${VERY_BRIGHT_WANT_SUNGLASSES}x" == "truex" ]; then
-#  nohup sunglasses -db /sunlight/sunglasses.db -id "${SUNLIGHT_LOG_ID}" -listen tcp:80 -monitoring http://caddy/ -submission https://localhost/ 1>/var/log/sunglasses_stdout.log 2>/var/log/sunglasses_stderr.log &
-#fi
-
-cd /sunlight/testdata
-export CTLOG_NAME=${SUNLIGHT_LOG_NAME:-testlog}
-export CTLOG_SUBMISSION_BASE_URL=http://localhost/ct/v1
-test -f /sunlight/testdata/insert.sh && /sunlight/testdata/insert.sh
-
 # EOF
+
