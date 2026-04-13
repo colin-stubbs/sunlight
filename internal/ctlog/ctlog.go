@@ -422,6 +422,13 @@ func (l *Log) SetRootsFromPEM(ctx context.Context, pemBytes []byte) error {
 	return nil
 }
 
+// AcceptingSubmissions returns whether the log is accepting submissions. It can
+// only go from true to false, when the log becomes read-only, not back.
+func (l *Log) AcceptingSubmissions() bool {
+	// Turn read-only one week after the end of the shard window.
+	return time.Since(l.c.NotAfterLimit) < 7*24*time.Hour
+}
+
 // Backend is an object storage. It is dedicated to a single log instance.
 //
 // It can be eventually consistent, but writes must be durable once they return.
@@ -579,6 +586,7 @@ func computeCacheHash(Certificate []byte, IsPrecert bool, IssuerKeyHash [32]byte
 type pool struct {
 	pendingLeaves []*PendingLogEntry
 	byHash        map[cacheHash]waitEntryFunc
+	lowPriority   map[int]func() // pendingLeaves idx => cancel func
 
 	// done is closed when the pool has been sequenced and
 	// the results below are ready.
@@ -598,18 +606,23 @@ type waitEntryFunc func(ctx context.Context) (*sunlight.LogEntry, error)
 
 func newPool() *pool {
 	return &pool{
-		done:   make(chan struct{}),
-		byHash: make(map[cacheHash]waitEntryFunc),
+		done:        make(chan struct{}),
+		byHash:      make(map[cacheHash]waitEntryFunc),
+		lowPriority: make(map[int]func()),
 	}
 }
 
 var errPoolFull = fmtErrorf("rate limited")
+var errEvicted = fmtErrorf("evicted to make way for higher priority leaves")
 
 // addLeafToPool adds leaf to the current pool, unless it is found in a
 // deduplication cache. It returns a function that will wait until the pool is
 // sequenced and return the sequenced leaf, as well as the source of the
 // sequenced leaf (pool or cache if deduplicated, sequencer otherwise).
-func (l *Log) addLeafToPool(ctx context.Context, leaf *PendingLogEntry) (f waitEntryFunc, source string) {
+//
+// Low priority entries might get evicted to make space for high priority ones,
+// in which case the waitEntryFunc of the evicted entry will immediately return.
+func (l *Log) addLeafToPool(ctx context.Context, leaf *PendingLogEntry, lowPriority bool) (f waitEntryFunc, source string) {
 	// We could marginally more efficiently do uploadIssuer after checking the
 	// caches, but it's simpler for the the block below to be under a single
 	// poolMu lock, and uploadIssuer goes to the network so we don't want to
@@ -626,6 +639,11 @@ func (l *Log) addLeafToPool(ctx context.Context, leaf *PendingLogEntry) (f waitE
 	l.poolMu.Lock()
 	defer l.poolMu.Unlock()
 	p := l.currentPool
+	if err := p.err; err != nil {
+		return func(ctx context.Context) (*sunlight.LogEntry, error) {
+			return nil, err
+		}, "closed"
+	}
 	h := computeCacheHash(leaf.Certificate, leaf.IsPrecert, leaf.IssuerKeyHash)
 	if f, ok := p.byHash[h]; ok {
 		return f, "pool"
@@ -644,16 +662,43 @@ func (l *Log) addLeafToPool(ctx context.Context, leaf *PendingLogEntry) (f waitE
 	}
 	n := len(p.pendingLeaves)
 	if l.c.PoolSize > 0 && n >= l.c.PoolSize {
-		return func(ctx context.Context) (*sunlight.LogEntry, error) {
-			return nil, errPoolFull
-		}, "ratelimit"
+		if lowPriority || len(p.lowPriority) == 0 {
+			return func(ctx context.Context) (*sunlight.LogEntry, error) {
+				return nil, errPoolFull
+			}, "ratelimit"
+		}
+		for nn, cancel := range p.lowPriority {
+			cancel()
+			delete(p.lowPriority, nn)
+			n = nn
+			p.pendingLeaves[n] = leaf
+			break
+		}
+	} else {
+		p.pendingLeaves = append(p.pendingLeaves, leaf)
 	}
-	p.pendingLeaves = append(p.pendingLeaves, leaf)
+	var cancelChan chan struct{}
+	if lowPriority {
+		cancelChan = make(chan struct{})
+		p.lowPriority[n] = func() {
+			close(cancelChan)
+		}
+	}
 	f = func(ctx context.Context) (*sunlight.LogEntry, error) {
 		select {
 		case <-ctx.Done():
 			return nil, fmtErrorf("context canceled while waiting for sequencing: %w", ctx.Err())
+		case <-cancelChan:
+			return nil, errEvicted
 		case <-p.done:
+			if err := ctx.Err(); err != nil {
+				return nil, fmtErrorf("context canceled while waiting for sequencing: %w", err)
+			}
+			select {
+			case <-cancelChan:
+				return nil, errEvicted
+			default:
+			}
 			if p.err != nil {
 				return nil, p.err
 			}
@@ -709,6 +754,15 @@ func (l *Log) uploadIssuer(ctx context.Context, issuer []byte) error {
 	return nil
 }
 
+type SunsetLogError struct {
+	FinalTree      tlog.Tree
+	FinalTimestamp int64
+}
+
+func (SunsetLogError) Error() string {
+	return "the log is read-only"
+}
+
 func (l *Log) RunSequencer(ctx context.Context, period time.Duration) (err error) {
 	// If the sequencer stops, return errors for all pending and future leaves.
 	defer func() {
@@ -730,6 +784,9 @@ func (l *Log) RunSequencer(ctx context.Context, period time.Duration) (err error
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-t.C:
+			if !l.AcceptingSubmissions() {
+				return SunsetLogError{l.tree.Tree, l.tree.Time}
+			}
 			if err := l.sequence(ctx); err != nil {
 				return err
 			}

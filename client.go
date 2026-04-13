@@ -17,6 +17,7 @@ import (
 	"iter"
 	"log/slog"
 	"net/http"
+	"os"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -33,8 +34,7 @@ import (
 // entries as a Go iterator.
 type Client struct {
 	c   *torchwood.Client
-	f   *torchwood.TileFetcher
-	r   torchwood.TileReaderWithContext
+	r   torchwood.TileReader
 	cc  *ClientConfig
 	err error
 }
@@ -42,11 +42,29 @@ type Client struct {
 // ClientConfig is the configuration for a [Client].
 type ClientConfig struct {
 	// MonitoringPrefix is the c2sp.org/static-ct-api monitoring prefix.
+	//
+	// If the MonitoringPrefix has schema "file://", Client will read tiles from
+	// the local filesystem, and most other settings will be ignored.
+	//
+	// If it has schema "gzip+file://", the data tiles are expected to be
+	// gzip-compressed.
+	//
+	// If it has schema "archive+file://", Client will read tiles from a set of
+	// [archival zip files] in the specified directory.
+	//
+	// [archival zip files]:
+	// https://github.com/geomys/ct-archive/blob/main/README.md#archival-format
 	MonitoringPrefix string
 
 	// PublicKey is the public key of the log, used to verify checkpoints in
 	// [Client.Checkpoint] and SCTs in [Client.CheckInclusion].
 	PublicKey crypto.PublicKey
+
+	// AllowRFC6962ArchivalLeafs indicates whether to accept leafs archived from
+	// RFC 6962 logs, which lack the LeafIndex extension.
+	//
+	// See [LogEntry.RFC6962ArchivalLeaf] for details.
+	AllowRFC6962ArchivalLeafs bool
 
 	// HTTPClient is the HTTP client used to fetch tiles. If nil, a client is
 	// created with default timeouts and settings.
@@ -69,8 +87,13 @@ type ClientConfig struct {
 	// made by the Client. If zero, there is no limit.
 	ConcurrencyLimit int
 
-	// Cache, if set, is a directory where the client will cache verified
-	// non-partial tiles, following the same structure as the URLs.
+	// Cache, if set, is a directory where the client will permanently cache
+	// verified non-partial tiles, following the same structure as the URLs.
+	//
+	// This directory always grows and is never pruned by the client. Most
+	// clients, especially those scanning a log sequentially, have no need to
+	// set this. [Client.Entries] will still use in-memory caching for the
+	// duration of the call.
 	Cache string
 
 	// Logger is the logger used to log errors and progress.
@@ -80,7 +103,35 @@ type ClientConfig struct {
 
 // NewClient creates a new [Client].
 func NewClient(config *ClientConfig) (*Client, error) {
-	if config == nil || config.UserAgent == "" {
+	if schema, path, ok := strings.Cut(config.MonitoringPrefix, "://"); ok &&
+		(schema == "file" || schema == "archive+file" || schema == "gzip+file") {
+		if config.Cache != "" {
+			return nil, errors.New("sunlight: permanent cache cannot be used with file://")
+		}
+		root, err := os.OpenRoot(path)
+		if err != nil {
+			return nil, fmt.Errorf("sunlight: failed to open file:// monitoring prefix: %w", err)
+		}
+		tileFS := root.FS()
+		if schema == "archive+file" {
+			tileFS = torchwood.NewTileArchiveFS(root.FS())
+		}
+		options := []torchwood.TileFSOption{torchwood.WithTileFSTilePath(TilePath)}
+		if schema == "gzip+file" {
+			options = append(options, torchwood.WithGzipDataTiles())
+		}
+		tileReader, err := torchwood.NewTileFS(tileFS, options...)
+		if err != nil {
+			return nil, fmt.Errorf("sunlight: failed to create file:// tile reader: %w", err)
+		}
+		client, err := torchwood.NewClient(tileReader, torchwood.WithCutEntry(cutEntry))
+		if err != nil {
+			return nil, fmt.Errorf("sunlight: failed to create file:// client: %w", err)
+		}
+		return &Client{c: client, r: tileReader, cc: config}, nil
+	}
+
+	if config.UserAgent == "" {
 		return nil, errors.New("sunlight: missing UserAgent")
 	}
 	if !strings.Contains(config.UserAgent, "@") &&
@@ -96,7 +147,7 @@ func NewClient(config *ClientConfig) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	var tileReader torchwood.TileReaderWithContext = fetcher
+	var tileReader torchwood.TileReader = fetcher
 	if config.Cache != "" {
 		tileReader, err = torchwood.NewPermanentCache(tileReader, config.Cache,
 			torchwood.WithPermanentCacheLogger(config.Logger),
@@ -110,23 +161,35 @@ func NewClient(config *ClientConfig) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{c: client, f: fetcher, r: tileReader, cc: config}, nil
+	return &Client{c: client, r: tileReader, cc: config}, nil
 }
 
-// Fetcher returns the underlying [torchwood.TileFetcher], which can be used to
-// fetch endpoints directly, or as a [tlog.HashReader] via
+// TileReader returns the underlying [torchwood.TileReader], which can be used
+// to fetch endpoints directly, or as a [tlog.HashReader] via
 // [torchwood.TileHashReaderWithContext].
 //
-// It does not use [ClientConfig.Cache]. If needed, use [torchwood.NewPermanentCache].
-func (c *Client) Fetcher() *torchwood.TileFetcher {
-	return c.f
+// Its [torchwood.TileReader.ReadTiles] method respects [ClientConfig.Cache] if
+// set. [torchwood.TileReader.ReadEndpoint] does not.
+func (c *Client) TileReader() torchwood.TileReader {
+	return c.r
+}
+
+// Fetcher used to return the underlying [torchwood.TileFetcher]. It is now a
+// compatibility alias of [Client.TileReader], which now exposes a
+// [torchwood.TileReader.ReadEndpoint] method.
+//
+// Deprecated: use [Client.TileReader] instead.
+//
+//go:fix inline
+func (c *Client) Fetcher() torchwood.TileReader {
+	return c.TileReader()
 }
 
 func cutEntry(tile []byte) (entry []byte, rh tlog.Hash, rest []byte, err error) {
 	// This implementation is terribly inefficient, parsing the whole entry just
 	// to re-serialize and throw it away. If this function shows up in profiles,
 	// let me know and I'll improve it.
-	e, rest, err := ReadTileLeaf(tile)
+	e, rest, err := ReadTileLeafMaybeArchival(tile)
 	if err != nil {
 		return nil, tlog.Hash{}, nil, err
 	}
@@ -163,7 +226,16 @@ func (c *Client) Entries(ctx context.Context, tree tlog.Tree, start int64) iter.
 	c.err = nil
 	return func(yield func(int64, *LogEntry) bool) {
 		for i, e := range c.c.Entries(ctx, tree, start) {
-			entry, rest, err := ReadTileLeaf(e)
+			var (
+				entry *LogEntry
+				rest  []byte
+				err   error
+			)
+			if c.cc.AllowRFC6962ArchivalLeafs {
+				entry, rest, err = ReadTileLeafMaybeArchival(e)
+			} else {
+				entry, rest, err = ReadTileLeaf(e)
+			}
 			if err != nil {
 				c.err = err
 				return
@@ -179,12 +251,45 @@ func (c *Client) Entries(ctx context.Context, tree tlog.Tree, start int64) iter.
 	}
 }
 
+// Entry returns a log entry by its index, and an inclusion proof in the tree.
+//
+// The provided tree should have been verified by the caller, for example using
+// [Client.Checkpoint].
+func (c *Client) Entry(ctx context.Context, tree tlog.Tree, index int64) (*LogEntry, tlog.RecordProof, error) {
+	e, proof, err := c.c.Entry(ctx, tree, index)
+	if err != nil {
+		return nil, nil, err
+	}
+	var (
+		entry *LogEntry
+		rest  []byte
+	)
+	if c.cc.AllowRFC6962ArchivalLeafs {
+		entry, rest, err = ReadTileLeafMaybeArchival(e)
+	} else {
+		entry, rest, err = ReadTileLeaf(e)
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("sunlight: failed to parse log entry %d: %w", index, err)
+	}
+	if len(rest) > 0 {
+		return nil, nil, fmt.Errorf("sunlight: unexpected trailing data in entry %d", index)
+	}
+	if !entry.RFC6962ArchivalLeaf && entry.LeafIndex != index {
+		return nil, nil, fmt.Errorf("sunlight: log entry index %d does not match requested index %d", entry.LeafIndex, index)
+	}
+	return entry, proof, nil
+}
+
 // ErrWrongLogID indicates that the log ID in the SCT does not match the public
 // key of the log. [Client.CheckInclusion] can return an error wrapping this.
 var ErrWrongLogID = errors.New("sunlight: SCT log ID does not match public key")
 
 // CheckInclusion fetches the log entry for the given SCT, and verifies that it
 // is included in the given tree and that the SCT is valid for the entry.
+//
+// The provided tree should have been verified by the caller, for example using
+// [Client.Checkpoint].
 //
 // If the SCT log ID does not match [ClientConfig.PublicKey], CheckInclusion
 // returns an error wrapping [ErrWrongLogID].
@@ -207,19 +312,9 @@ func (c *Client) CheckInclusion(ctx context.Context, tree tlog.Tree, sct []byte)
 	if err != nil {
 		return nil, nil, fmt.Errorf("sunlight: failed to parse SCT extensions: %w", err)
 	}
-	e, proof, err := c.c.Entry(ctx, tree, ext.LeafIndex)
+	entry, proof, err := c.Entry(ctx, tree, ext.LeafIndex)
 	if err != nil {
 		return nil, nil, fmt.Errorf("sunlight: failed to fetch log entry %d: %w", ext.LeafIndex, err)
-	}
-	entry, rest, err := ReadTileLeaf(e)
-	if err != nil {
-		return nil, nil, fmt.Errorf("sunlight: failed to parse log entry %d: %w", ext.LeafIndex, err)
-	}
-	if len(rest) > 0 {
-		return nil, nil, fmt.Errorf("sunlight: unexpected trailing data in entry	%d", ext.LeafIndex)
-	}
-	if entry.LeafIndex != ext.LeafIndex {
-		return nil, nil, fmt.Errorf("sunlight: SCT leaf index %d does not match entry leaf index %d", ext.LeafIndex, entry.LeafIndex)
 	}
 	if entry.Timestamp != int64(s.Timestamp) {
 		return nil, nil, fmt.Errorf("sunlight: SCT timestamp %d does not match entry timestamp %d", s.Timestamp, entry.Timestamp)
@@ -236,7 +331,7 @@ func (c *Client) CheckInclusion(ctx context.Context, tree tlog.Tree, sct []byte)
 // [note.Note.Sigs] entry. [RFC6962SignatureTimestamp] can be used to extract
 // the STH timestamp from the signature.
 func (c *Client) Checkpoint(ctx context.Context) (torchwood.Checkpoint, *note.Note, error) {
-	signedNote, err := c.f.ReadEndpoint(ctx, "checkpoint")
+	signedNote, err := c.r.ReadEndpoint(ctx, "checkpoint")
 	if err != nil {
 		return torchwood.Checkpoint{}, nil, fmt.Errorf("sunlight: failed to fetch checkpoint: %w", err)
 	}
@@ -271,7 +366,7 @@ func (c *Client) Checkpoint(ctx context.Context) (torchwood.Checkpoint, *note.No
 // [LogEntry.ChainFingerprints].
 func (c *Client) Issuer(ctx context.Context, fp [32]byte) (*x509.Certificate, error) {
 	endpoint := fmt.Sprintf("issuer/%x", fp)
-	cert, err := c.f.ReadEndpoint(ctx, endpoint)
+	cert, err := c.r.ReadEndpoint(ctx, endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("sunlight: failed to fetch issuer certificate for %x: %w", fp, err)
 	}

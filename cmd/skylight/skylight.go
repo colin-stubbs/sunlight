@@ -36,6 +36,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -174,7 +175,18 @@ func clientFromContext(ctx context.Context) string {
 
 func newClientContextHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if userAgent := r.UserAgent(); strings.Contains(userAgent, "changeme@example.com") {
+		// If you are reading this to figure out how to bypass the rate limit,
+		// we know it's easy, but please don't. We also know how to make your
+		// life harder by blocking your ASN or fingerprinting your client.
+		//
+		// There's no need to bypass anything!
+		//
+		// We don't need to know who you are, we only want to be able to contact
+		// you if necessary: you can just register a throwaway email address,
+		// forward it to your email, and put that in your User-Agent.
+		//
+		// Thank you!
+		if userAgent := r.UserAgent(); strings.Contains(userAgent, "example.com") {
 			r = r.WithContext(context.WithValue(r.Context(), clientContextKey{}, "anonymous"))
 		} else if strings.Contains(userAgent, "@") {
 			r = r.WithContext(context.WithValue(r.Context(), clientContextKey{}, "with-email"))
@@ -299,7 +311,7 @@ func main() {
 			fatalError(logger, "failed to open local directory", "err", err)
 		}
 		roots[lc] = root
-		handler := http.FileServerFS(root.FS())
+		handler := http.StripPrefix(prefix.Path, http.FileServerFS(root.FS()))
 
 		// Wrap the file handler with duration and response size metrics.
 		// Avoid tracking the size and duration of errors or simple responses.
@@ -387,6 +399,22 @@ func main() {
 		})
 	}
 
+	mux.HandleFunc("/logs.json", func(w http.ResponseWriter, r *http.Request) {
+		reused := reused.LabelFromContext(r.Context())
+		client := clientFromContext(r.Context())
+		reqCount.WithLabelValues("", "logs.json", client, reused, "200").Inc()
+
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Content-Type", "application/json")
+
+		var logs []string
+		for log := range roots {
+			logs = append(logs, log.MonitoringPrefix)
+		}
+		slices.Sort(logs)
+		json.NewEncoder(w).Encode(logs)
+	})
+
 	if c.HomeRedirect != "" {
 		mux.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
 			reused := reused.LabelFromContext(r.Context())
@@ -402,7 +430,9 @@ func main() {
 		buf := &bytes.Buffer{}
 		for log, root := range roots {
 			if err := checkLog(root); err != nil {
-				if log.Staging {
+				if errors.Is(err, errLogSunset) {
+					fmt.Fprintf(buf, "%s: read-only\n", log.ShortName)
+				} else if log.Staging {
 					fmt.Fprintf(buf, "%s: %v (ignored)\n", log.ShortName, err)
 				} else {
 					status = http.StatusInternalServerError
@@ -496,7 +526,17 @@ func main() {
 type logInfo struct {
 	Name         string `json:"description"`
 	PublicKeyDER []byte `json:"key"`
+	Interval     struct {
+		NotAfterLimit string `json:"end_exclusive"`
+	} `json:"temporal_interval"`
+	FinalTree struct {
+		RootHash  []byte `json:"sha256_root_hash"`
+		Size      int64  `json:"tree_size"`
+		Timestamp int64  `json:"timestamp"`
+	} `json:"final_tree_head,omitzero"`
 }
+
+var errLogSunset = errors.New("log is read-only")
 
 func checkLog(root *os.Root) error {
 	logJSON, err := fs.ReadFile(root.FS(), "log.v3.json")
@@ -533,6 +573,26 @@ func checkLog(root *os.Root) error {
 	t, err := sunlight.RFC6962SignatureTimestamp(n.Sigs[0])
 	if err != nil {
 		return fmt.Errorf("failed to parse signature timestamp: %w", err)
+	}
+	notAfterLimit, err := time.Parse(time.RFC3339, log.Interval.NotAfterLimit)
+	if err != nil {
+		return fmt.Errorf("failed to parse NotAfterLimit: %w", err)
+	}
+	if time.Since(notAfterLimit) > 7*24*time.Hour+3*time.Second {
+		if log.FinalTree.RootHash == nil {
+			return fmt.Errorf("log is past NotAfterLimit + 1 week and has no final tree")
+		}
+		if !bytes.Equal(log.FinalTree.RootHash, checkpoint.Hash[:]) {
+			return fmt.Errorf("mismatching final tree hash")
+		}
+		if log.FinalTree.Size != checkpoint.N {
+			return fmt.Errorf("mismatching final tree size")
+		}
+		if log.FinalTree.Timestamp != t {
+			return fmt.Errorf("mismatching final tree timestamp")
+		}
+		// The log is read-only, so the checkpoint can be old.
+		return errLogSunset
 	}
 	if ct := time.UnixMilli(t); time.Since(ct) > 5*time.Second {
 		return fmt.Errorf("checkpoint is too old: %v", ct)

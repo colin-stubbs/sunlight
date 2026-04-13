@@ -63,7 +63,7 @@ func NewEmptyTestLog(t testing.TB) *TestLog {
 		Lock:          NewMemoryLockBackend(t),
 		Log:           slog.New(logHandler),
 		NotAfterStart: time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC),
-		NotAfterLimit: time.Date(2024, time.July, 1, 0, 0, 0, 0, time.UTC),
+		NotAfterLimit: time.Date(2099, time.January, 1, 0, 0, 0, 0, time.UTC),
 	}
 	err = ctlog.CreateLog(t.Context(), config)
 	fatalIfErr(t, err)
@@ -318,7 +318,8 @@ func (tl *TestLog) StartSequencer() {
 	tl.t.Cleanup(cancel)
 	go func() {
 		err := tl.Log.RunSequencer(ctx, 50*time.Millisecond)
-		if err != context.Canceled {
+		if err != nil && !errors.Is(err, context.Canceled) &&
+			!errors.As(err, new(ctlog.SunsetLogError)) {
 			tl.t.Errorf("RunSequencer returned an error: %v", err)
 		}
 	}()
@@ -432,16 +433,6 @@ func (r *tileReader) ReadTiles(tiles []tlog.Tile) (data [][]byte, err error) {
 
 func (r *tileReader) SaveTiles(tiles []tlog.Tile, data [][]byte) {}
 
-type verifier struct {
-	name   string
-	hash   uint32
-	verify func(msg, sig []byte) bool
-}
-
-func (v *verifier) Name() string                { return v.name }
-func (v *verifier) KeyHash() uint32             { return v.hash }
-func (v *verifier) Verify(msg, sig []byte) bool { return v.verify(msg, sig) }
-
 type MemoryBackend struct {
 	t   testing.TB
 	mu  sync.Mutex
@@ -449,7 +440,7 @@ type MemoryBackend struct {
 	imm map[string]bool
 	del map[string]bool
 
-	uploads uint64
+	uploads atomic.Uint64
 
 	UploadCallback func(key string, data []byte) (apply bool, err error)
 }
@@ -461,7 +452,7 @@ func NewMemoryBackend(t testing.TB) *MemoryBackend {
 }
 
 func (b *MemoryBackend) Upload(ctx context.Context, key string, data []byte, opts *ctlog.UploadOptions) error {
-	atomic.AddUint64(&b.uploads, 1)
+	b.uploads.Add(1)
 	// TODO: check key format is expected.
 	if len(data) == 0 && key != "_roots.pem" {
 		b.t.Errorf("uploaded key %q with empty data", key)
